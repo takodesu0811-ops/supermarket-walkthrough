@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>スーパー600㎡ ウォークスルー（焼き付けの試し）</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: "BIZ UDPGothic", "Noto Sans JP", sans-serif; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+           background: rgba(0,0,0,.55); color: #fff; cursor: pointer; gap: 12px; text-align: center; }
+  #start h1 { margin: 0; font-size: 22px; font-weight: 600; }
+  #start p { margin: 0; opacity: .85; }
+  #hint { position: fixed; left: 28px; bottom: 28px; color: #fff; text-shadow: 1px 1px 2px #000; font-size: 14px; display: none; }
+  .keys { display: grid; grid-template-columns: repeat(3, 40px); gap: 4px; margin-bottom: 8px; }
+  .key { width: 40px; height: 40px; background: rgba(255,255,255,.9); color: #111; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+  #fps { position: fixed; right: 12px; top: 10px; color: #fff; font: 12px monospace; text-shadow: 1px 1px 2px #000; }
+</style>
+</head>
+<body>
+<div id="start"><h1>スーパー600㎡ ウォークスルー</h1><p id="status">読み込み中…</p></div>
+<div id="hint">
+  <div class="keys"><span></span><div class="key">W</div><span></span><div class="key">A</div><div class="key">S</div><div class="key">D</div></div>
+  移動：WASD　見回す：マウス<br>焼き付け あり/なし：L　明るさ：[ ]<br>やめる：Esc
+</div>
+<div id="fps"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+// 座標：glTF は Y が上。Blender の (x, y) は glTF の (x, -z)。単位はメートル
+const EYE = 1.6, SPEED = 4.5, RADIUS = 0.35, DOOR_DIST = 2.3;
+const START = new THREE.Vector3(25.2, EYE, -1.5);   // 入口の内側（UEの Player Start と同じ所）
+// 比べる写真用：?pos=x,z&yaw=度&bake=0|1 で、その場所・向き・焼き付けの有無で開く
+const Q = new URLSearchParams(location.search);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = 1.5;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 500);
+camera.position.copy(START);
+camera.lookAt(START.x, EYE, START.z - 10);   // 北（店の奥）を向く
+if (Q.has('pos')) {
+  const [x, z] = Q.get('pos').split(',').map(Number);
+  camera.position.set(x, Number(Q.get('h') || EYE), z);
+  camera.rotation.set(THREE.MathUtils.degToRad(Number(Q.get('pitch') || 0)),
+                      THREE.MathUtils.degToRad(Number(Q.get('yaw') || 0)), 0, 'YXZ');
+}
+
+// 外の景色と、空からの光（Blender・UEと同じHDRI）
+new RGBELoader().load('hdri/driving_school_2k.hdr', tex => {
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  scene.background = tex;
+  scene.environment = tex;
+  scene.environmentIntensity = Number(Q.get('env') || 0.8);   // ?env=強さ で試せる（段階2までは1.3）
+});
+// 店の中の明るさを足す（天井の照明の代わり）。焼いていない棚などだけが受ける。?hemi=強さ で試せる（段階2までは1.4、段階3で0.6）
+scene.add(new THREE.HemisphereLight(0xfff3e0, 0xb8a98f, Number(Q.get('hemi') || 0.6)));
+
+const status = document.getElementById('status');
+const solids = [];      // 当たり判定に使う形（壁・ドアなど。光線で調べる）
+const boxes = [];       // 棚・台・ケースなどを囲む見えない箱（床の上の四角で調べる）
+const doors = [];       // 裏方のドアの板
+// 壁まわりとドアは今までどおり光線で。それ以外の置いてある物は箱で囲む
+const STRUCTURE = /Wall|Floor|Ceiling|Skirting|Sill|Window|Column|Pillar|Door|Shutter/;
+
+// Blenderで焼き付けた光と影（2つ目のUVで貼る）。焼いた物は照明を受けず、この画像だけで明るさが決まる
+const baked = [];       // { mesh, original, bakedMat }
+let bakeOn = Q.get('bake') !== '0', bakeLevel = Number(Q.get('level') || 2.0);   // 段階3で1→2.0（10/24）
+// 段階3：焼いた光は3900Kで、白い壁に掛けると茶色に寄った → 色を戻す掛け算（?wb=r,g,b で試せる）
+const WB = new THREE.Vector3(...(Q.get('wb') || '1,1.3,1.85').split(',').map(Number));
+// 2つ目のUVを持つ形（床・壁・天井）にだけ貼る。床と天井は1枚ずつ、壁は全部で1枚
+const LM = 'lightmaps/';
+function lightmapFor(name) {
+  if (/FloorSlab/.test(name)) return LM + 'floor_lm.exr';
+  if (/Ceiling$|Ceiling /.test(name)) return LM + 'ceiling_lm.exr';
+  return LM + 'walls_lm.exr';
+}
+// 壁・天井を焼いたglTF（段階2）。?gltf=old で床だけ焼いた時の物
+const GLTF = Q.get('gltf') === 'old' ? '../Unreal/import/full/Supermarket.gltf' : 'model/Supermarket_bake.gltf';
+const texCache = {};
+function loadLightmap(url) {
+  return texCache[url] ??= new Promise((ok, ng) => new EXRLoader().load(url, ok, undefined, ng));
+}
+function applyBake() {
+  for (const b of baked) {
+    b.bakedMat.lightMapIntensity = bakeLevel;
+    b.mesh.material = bakeOn ? b.bakedMat : b.original;
+  }
+}
+function addBake(mesh, url) {
+  loadLightmap(url).then(tex => {
+    tex.channel = 1;          // 2つ目のUV（床は UVMap_売場全体、壁・天井は UVMap_Lightmap）
+    tex.flipY = true;         // EXRは上下が逆に読まれるので戻す（10/23 棚の影の位置で確かめた）
+    // EXRLoader はミップマップを作らない → 遠くや斜めで細い線が飛び飛びになり、のこぎり模様が出た（10/23 検品）
+    tex.generateMipmaps = true;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    tex.needsUpdate = true;
+    const m = mesh.material;
+    const bakedMat = new THREE.MeshBasicMaterial({ map: m.map, color: m.color, lightMap: tex, side: m.side });
+    // 焼いたのは売場（UVの0〜1）だけ。裏方の個室（UVの外）は影を付けず、通路と同じ明るさにする
+    bakedMat.onBeforeCompile = s => {
+      s.uniforms.uWB = { value: WB };
+      s.fragmentShader = 'uniform vec3 uWB;\n' + s.fragmentShader.replace(
+        'vec4 lightMapTexel = texture2D( lightMap, vLightMapUv );',
+        `bool inBake = all(greaterThanEqual(vLightMapUv, vec2(0.0))) && all(lessThanEqual(vLightMapUv, vec2(1.0)));
+         vec4 lightMapTexel = inBake ? texture2D( lightMap, vLightMapUv ) : vec4(0.80, 0.51, 0.27, 1.0);
+         lightMapTexel.rgb *= uWB;`);
+    };
+    baked.push({ mesh, original: m, bakedMat });
+    applyBake();
+  }, err => console.warn('焼き付けの画像が読めない', url, err));
+}
+
+new GLTFLoader().load(GLTF, gltf => {
+  const root = gltf.scene;
+  root.updateMatrixWorld(true);
+  root.traverse(o => {
+    if (o.isMesh) {
+      const name = o.name + ' ' + (o.parent?.name || '');
+      if (STRUCTURE.test(name)) solids.push(o);
+      else {
+        // 頭より上（吊り下げの案内板・照明・空調）と、床の線・マットは囲まない
+        const b = new THREE.Box3().setFromObject(o);
+        if (b.min.y < 1.9 && b.max.y > 0.15) boxes.push(b);
+      }
+    }
+    if (o.isMesh && o.geometry.attributes.uv1) addBake(o, lightmapFor(o.name + ' ' + (o.parent?.name || '')));
+    if (/^SM_R\d\w*_Door_Leaf$/.test(o.name)) {
+      const center = new THREE.Vector3(o.position.x + 0.6, EYE, o.position.z);  // 板の中央（蝶番から0.6m）
+      doors.push({ node: o, center, angle: 0 });
+    }
+  });
+  // 荷受け口の穴をふさぐ（UEではシャッターを置いた所）
+  const shutter = new THREE.Mesh(new THREE.BoxGeometry(3.0, 2.4, 0.02),
+    new THREE.MeshStandardMaterial({ color: 0x9a9a9a, metalness: 0.6, roughness: 0.45 }));
+  shutter.position.set(4.1, 1.2, -19.9);
+  root.add(shutter); solids.push(shutter);
+  scene.add(root);
+  status.textContent = 'クリックで開始';
+}, e => { if (e.total) status.textContent = `読み込み中… ${Math.round(e.loaded / e.total * 100)}%`; },
+   err => { status.textContent = '読み込みに失敗しました：' + err; });
+
+const controls = new PointerLockControls(camera, document.body);
+const start = document.getElementById('start'), hint = document.getElementById('hint');
+start.addEventListener('click', () => controls.lock());
+if (Q.has('shot')) start.style.display = 'none';   // 比べる写真を撮るとき（?shot=1）は「クリックで開始」を隠す
+controls.addEventListener('lock', () => { start.style.display = 'none'; hint.style.display = 'block'; });
+controls.addEventListener('unlock', () => { start.style.display = 'flex'; hint.style.display = 'none'; status.textContent = 'クリックで再開'; });
+
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyL') bakeOn = !bakeOn;
+  if (e.code === 'BracketLeft') bakeLevel = Math.max(0.1, bakeLevel / 1.15);
+  if (e.code === 'BracketRight') bakeLevel = Math.min(20, bakeLevel * 1.15);
+  applyBake();
+});
+addEventListener('keyup', e => keys[e.code] = false);
+
+const ray = new THREE.Raycaster();
+function blocked(from, dir) {
+  // ひざと胸の高さで、進む向きに壁があるか
+  for (const h of [0.4, 1.2]) {
+    ray.set(new THREE.Vector3(from.x, h, from.z), dir);
+    ray.far = RADIUS;
+    if (ray.intersectObjects(solids, false).length) return true;
+  }
+  return false;
+}
+function inBox(x, z) {
+  // 体（半径 RADIUS の円）が、どれかの箱に入るか
+  for (const b of boxes) {
+    const dx = Math.max(b.min.x - x, 0, x - b.max.x), dz = Math.max(b.min.z - z, 0, z - b.max.z);
+    if (dx * dx + dz * dz < RADIUS * RADIUS) return true;
+  }
+  return false;
+}
+
+const clock = new THREE.Clock();
+let frames = 0, acc = 0;
+const fpsEl = document.getElementById('fps');
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (controls.isLocked) {
+    const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, camera.up);
+    const move = new THREE.Vector3();
+    if (keys.KeyW) move.add(fwd); if (keys.KeyS) move.sub(fwd);
+    if (keys.KeyD) move.add(right); if (keys.KeyA) move.sub(right);
+    if (move.lengthSq() > 0) {
+      move.normalize();
+      // 壁に沿ってすべるように、x と z を別々に試す
+      for (const axis of ['x', 'z']) {
+        const step = new THREE.Vector3(); step[axis] = move[axis];
+        if (step.lengthSq() === 0) continue;
+        const next = camera.position.clone(); next[axis] += move[axis] * SPEED * dt;
+        if (!blocked(camera.position, step.clone().normalize()) && !inBox(next.x, next.z)) camera.position.copy(next);
+      }
+    }
+  }
+  // 裏方のドア：2.3m以内で内側へ90°開く
+  for (const d of doors) {
+    const near = camera.position.distanceTo(d.center) < DOOR_DIST;
+    d.angle += ((near ? Math.PI / 2 : 0) - d.angle) * Math.min(1, dt * 4);
+    d.node.rotation.y = d.angle;
+  }
+  renderer.render(scene, camera);
+  frames++; acc += dt;
+  if (acc > 0.5) {
+    fpsEl.textContent = `${Math.round(frames / acc)} fps　焼き付け ${bakeOn ? 'あり' : 'なし'} ×${bakeLevel.toFixed(2)}`;
+    frames = 0; acc = 0;
+  }
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
