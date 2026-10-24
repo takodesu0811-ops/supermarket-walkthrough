@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>スーパー600㎡ ウォークスルー（焼き付けの試し）</title>
 <style>
   html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: "BIZ UDPGothic", "Noto Sans JP", sans-serif; }
@@ -14,6 +14,14 @@
   .keys { display: grid; grid-template-columns: repeat(3, 40px); gap: 4px; margin-bottom: 8px; }
   .key { width: 40px; height: 40px; background: rgba(255,255,255,.9); color: #111; display: flex; align-items: center; justify-content: center; font-weight: 700; }
   #fps { position: fixed; right: 12px; top: 10px; color: #fff; font: 12px monospace; text-shadow: 1px 1px 2px #000; }
+  /* スマホ：指でページが動いたり拡大されたりしないように */
+  canvas { touch-action: none; }
+  #touchHint { position: fixed; left: 0; right: 0; bottom: 14px; text-align: center; color: #fff; font-size: 13px;
+               text-shadow: 1px 1px 2px #000; pointer-events: none; display: none; }
+  #stick { position: fixed; width: 110px; height: 110px; margin: -55px 0 0 -55px; border-radius: 50%;
+           border: 2px solid rgba(255,255,255,.7); background: rgba(0,0,0,.15); pointer-events: none; display: none; }
+  #knob { position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%;
+          background: rgba(255,255,255,.85); }
 </style>
 </head>
 <body>
@@ -23,6 +31,8 @@
   移動：WASD　見回す：マウス<br>焼き付け あり/なし：L　明るさ：[ ]<br>やめる：Esc
 </div>
 <div id="fps"></div>
+<div id="touchHint">左を指でずらす：歩く　右をなぞる：見回す</div>
+<div id="stick"><div id="knob"></div></div>
 
 <script type="importmap">
 { "imports": {
@@ -51,7 +61,9 @@ renderer.toneMappingExposure = 1.5;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 500);
+// 縦長の画面（スマホの縦向き）だと横に見える範囲がせまく、天井と壁ばかりになった（10/24）→ 縦長のときは見える範囲を広げる
+const fovFor = aspect => aspect < 1 ? 95 : 75;
+const camera = new THREE.PerspectiveCamera(fovFor(innerWidth / innerHeight), innerWidth / innerHeight, 0.05, 500);
 camera.position.copy(START);
 camera.lookAt(START.x, EYE, START.z - 10);   // 北（店の奥）を向く
 if (Q.has('pos')) {
@@ -152,13 +164,27 @@ new GLTFLoader().load(GLTF, gltf => {
   shutter.position.set(4.1, 1.2, -19.9);
   root.add(shutter); solids.push(shutter);
   scene.add(root);
-  status.textContent = 'クリックで開始';
+  status.textContent = TOUCH ? 'タップで開始' : 'クリックで開始';
 }, e => { if (e.total) status.textContent = `読み込み中… ${Math.round(e.loaded / e.total * 100)}%`; },
    err => { status.textContent = '読み込みに失敗しました：' + err; });
 
 const controls = new PointerLockControls(camera, document.body);
 const start = document.getElementById('start'), hint = document.getElementById('hint');
-start.addEventListener('click', () => controls.lock());
+// スマホ（指で操作する画面）では、マウスを閉じこめるしくみ（PointerLock）がないので、指の操作に切りかえる（10/24）
+const TOUCH = matchMedia('(pointer: coarse)').matches || Q.has('touch');
+let touchActive = false;
+if (Q.has('debug')) window.__cam = camera;   // 確かめ用（?debug）：外からカメラの位置と向きを読む
+start.addEventListener('click', () => {
+  if (!TOUCH) { controls.lock(); return; }
+  touchActive = true;
+  start.style.display = 'none';
+  document.getElementById('touchHint').style.display = 'block';
+  updateTouchHint();
+});
+function updateTouchHint() {
+  document.getElementById('touchHint').innerHTML = '左を指でずらす：歩く　右をなぞる：見回す'
+    + (innerWidth < innerHeight ? '<br>スマホを横にすると見やすくなります' : '');
+}
 if (Q.has('shot')) start.style.display = 'none';   // 比べる写真を撮るとき（?shot=1）は「クリックで開始」を隠す
 controls.addEventListener('lock', () => { start.style.display = 'none'; hint.style.display = 'block'; });
 controls.addEventListener('unlock', () => { start.style.display = 'flex'; hint.style.display = 'none'; status.textContent = 'クリックで再開'; });
@@ -172,6 +198,54 @@ addEventListener('keydown', e => {
   applyBake();
 });
 addEventListener('keyup', e => keys[e.code] = false);
+
+// 指の操作：画面の左半分＝スティック（押した所が中心。ずらした量で速さが変わる）、右半分＝なぞって見回す
+const STICK_R = 55, LOOK_SPEED = 0.005;
+const joy = { id: null, x0: 0, y0: 0, x: 0, y: 0 };   // x, y は -1〜1（y は上が -）
+const look = { id: null, x: 0, y: 0 };
+const stickEl = document.getElementById('stick'), knobEl = document.getElementById('knob');
+const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+const canvas = renderer.domElement;
+canvas.addEventListener('touchstart', e => {
+  if (!touchActive) return;
+  for (const t of e.changedTouches) {
+    if (t.clientX < innerWidth / 2 && joy.id === null) {
+      Object.assign(joy, { id: t.identifier, x0: t.clientX, y0: t.clientY, x: 0, y: 0 });
+      stickEl.style.left = t.clientX + 'px'; stickEl.style.top = t.clientY + 'px'; stickEl.style.display = 'block';
+      knobEl.style.transform = '';
+    } else if (look.id === null) {
+      Object.assign(look, { id: t.identifier, x: t.clientX, y: t.clientY });
+    }
+  }
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joy.id) {
+      let dx = t.clientX - joy.x0, dy = t.clientY - joy.y0;
+      const len = Math.hypot(dx, dy);
+      if (len > STICK_R) { dx *= STICK_R / len; dy *= STICK_R / len; }
+      joy.x = dx / STICK_R; joy.y = dy / STICK_R;
+      knobEl.style.transform = `translate(${dx}px, ${dy}px)`;
+    } else if (t.identifier === look.id) {
+      euler.setFromQuaternion(camera.quaternion);
+      euler.y -= (t.clientX - look.x) * LOOK_SPEED;
+      euler.x -= (t.clientY - look.y) * LOOK_SPEED;
+      euler.x = Math.max(-1.4, Math.min(1.4, euler.x));   // 真上・真下まで回りすぎないように
+      camera.quaternion.setFromEuler(euler);
+      look.x = t.clientX; look.y = t.clientY;
+    }
+  }
+  e.preventDefault();
+}, { passive: false });
+function touchEnd(e) {
+  for (const t of e.changedTouches) {
+    if (t.identifier === joy.id) { joy.id = null; joy.x = joy.y = 0; stickEl.style.display = 'none'; }
+    if (t.identifier === look.id) look.id = null;
+  }
+}
+canvas.addEventListener('touchend', touchEnd);
+canvas.addEventListener('touchcancel', touchEnd);
 
 const ray = new THREE.Raycaster();
 function blocked(from, dir) {
@@ -197,14 +271,16 @@ let frames = 0, acc = 0;
 const fpsEl = document.getElementById('fps');
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
-  if (controls.isLocked) {
+  if (controls.isLocked || touchActive) {
     const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
     const right = new THREE.Vector3().crossVectors(fwd, camera.up);
     const move = new THREE.Vector3();
     if (keys.KeyW) move.add(fwd); if (keys.KeyS) move.sub(fwd);
     if (keys.KeyD) move.add(right); if (keys.KeyA) move.sub(right);
+    // スティック：ずらした量（0〜1）がそのまま速さになる
+    move.addScaledVector(fwd, -joy.y).addScaledVector(right, joy.x);
     if (move.lengthSq() > 0) {
-      move.normalize();
+      if (move.lengthSq() > 1) move.normalize();
       // 壁に沿ってすべるように、x と z を別々に試す
       for (const axis of ['x', 'z']) {
         const step = new THREE.Vector3(); step[axis] = move[axis];
@@ -229,7 +305,8 @@ renderer.setAnimationLoop(() => {
 });
 
 addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  camera.aspect = innerWidth / innerHeight; camera.fov = fovFor(camera.aspect); camera.updateProjectionMatrix();
+  updateTouchHint();
   renderer.setSize(innerWidth, innerHeight);
 });
 </script>
